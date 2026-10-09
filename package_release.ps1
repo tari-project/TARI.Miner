@@ -201,7 +201,7 @@ RTX 50 backend for each card, including mixed-card rigs.
 
 Use a Custom miner with name `tari-miner-hiveos` and installation URL:
 
-`https://github.com/JustAResearcher/TARI.Miner/releases/download/v{0}/tari-miner-hiveos-{0}.tar.gz`
+`https://github.com/tari-project/TARI.Miner/releases/download/v{0}/tari-miner-hiveos-{0}.tar.gz`
 
 Set the wallet template to `%WAL%.%WORKER_NAME%`, pool URL to
 `stratum+tcp://taric29-ca.luckypool.io:3111`, and pass to `x`.
