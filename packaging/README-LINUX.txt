@@ -1,4 +1,4 @@
-TARI.Miner C29 v1.1.7
+TARI.Miner C29 v1.1.8
 =====================
 
 Community Tari Cuckaroo29 CUDA miner, with experimental AMD support. No
