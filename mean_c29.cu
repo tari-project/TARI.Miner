@@ -65,8 +65,15 @@ const u32 EDGES_B = NZ * NEPS_B / NEPS;
 const u32 ROW_EDGES_A = EDGES_A * NY;
 const u32 ROW_EDGES_B = EDGES_B * NY;
 
+// Warp-aggregated destination atomics: lanes writing the same bucket share
+// one atomicAdd, found with __match_any_sync. CUDA has that as one
+// instruction. HIP has no equivalent, and gpu_compat.h emulates it with a
+// ballot loop that runs once per distinct bucket in the wave: with 14-bit
+// buckets the 32 lanes are nearly always distinct, so every store in rounds
+// 0 to 3 pays about 32 serialized ds_bpermute round trips to aggregate
+// nothing. The AMD build takes one plain atomic per edge instead.
 #ifndef WARP_DST_ATOMICS
-#define WARP_DST_ATOMICS 1
+#define WARP_DST_ATOMICS (!TARI_GPU_HIP)
 #endif
 #ifndef WARP_DST_ATOMICS_LATE
 #define WARP_DST_ATOMICS_LATE 0

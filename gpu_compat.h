@@ -135,6 +135,11 @@ __device__ __forceinline__ unsigned tari_shfl_sync(unsigned mask, unsigned value
 // distinct value: each pass takes the lowest remaining lane's value and
 // removes every lane that holds it. `remaining` is the same in every lane, so
 // all lanes run the same number of passes.
+//
+// That makes it a loop of up to 32 cross-lane round trips, not one
+// instruction like CUDA's __match_any_sync. The trimmer therefore defaults
+// WARP_DST_ATOMICS to 0 under HIP; this helper only runs when a build turns
+// it back on.
 __device__ __forceinline__ unsigned tari_match_any_sync(unsigned mask, unsigned value) {
   const unsigned lane = __lane_id();
   unsigned remaining = mask;
