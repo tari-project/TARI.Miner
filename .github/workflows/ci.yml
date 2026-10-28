@@ -100,6 +100,19 @@ jobs:
           ./build_pool_miner.sh amd
           ./build_solver.sh amd reference
 
+      # The runner has no AMD GPU; the binaries are kept so a pull request can
+      # be checked on real hardware (docs/amd-validation.md) without a local
+      # hipcc.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: amd-binaries-${{ github.sha }}
+          path: |
+            bin/tari_c29_pool_miner_amd
+            bin/tari_c29_solver_amd
+            bin/validation/tari_c29_solver_amd_reference
+          if-no-files-found: error
+          retention-days: 14
+
       # The runner has no AMD GPU: the binaries must start, answer --help and
       # --version, and report that there is no device instead of crashing.
       - name: Run the AMD binaries without a GPU
