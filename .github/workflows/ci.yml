@@ -107,10 +107,12 @@ jobs:
             TARI_ARCH_FLAGS="-DTRIM_STAGE_TIMING=1 $flags" ./build_solver.sh amd
             mv bin/tari_c29_solver_amd "bin/variants/$name/tari_c29_solver_amd"
           done <<'VARIANTS'
-          cumode|-mcumode
-          cumode-rows1024|-mcumode -DROUND_TWO_LEVEL_DIAG=3 -DROUND_ROWS_TPB=1024
-          flush4|-DROUND_FLUSH=4
-          flush4-rows1024|-DROUND_FLUSH=4 -DROUND_TWO_LEVEL_DIAG=3 -DROUND_ROWS_TPB=1024
+          o2|-O2
+          o1|-O1
+          rows1024-o2|-O2 -DROUND_TWO_LEVEL_DIAG=3 -DROUND_ROWS_TPB=1024
+          rows1024-o1|-O1 -DROUND_TWO_LEVEL_DIAG=3 -DROUND_ROWS_TPB=1024
+          wave64|-mwavefrontsize64 -DTARI_ALLOW_WAVE64=1
+          wave64-rows1024|-mwavefrontsize64 -DTARI_ALLOW_WAVE64=1 -DROUND_TWO_LEVEL_DIAG=3 -DROUND_ROWS_TPB=1024
           onelevel|-DROUND_TWO_LEVEL=0
           VARIANTS
 

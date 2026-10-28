@@ -43,7 +43,9 @@
 // guard.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-pragma"
-#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE)
+// TARI_ALLOW_WAVE64 lifts the check for builds that use none of the lane-mask
+// helpers (WARP_DST_ATOMICS=0, no fused tail, no round-0 hash), for testing.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__AMDGCN_WAVEFRONT_SIZE) && !defined(TARI_ALLOW_WAVE64)
 #if __AMDGCN_WAVEFRONT_SIZE != 32
 #error "The AMD build needs 32-lane wavefronts: compile with -mno-wavefrontsize64 for RDNA (gfx10xx, gfx11xx, gfx12xx)"
 #endif

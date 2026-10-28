@@ -77,6 +77,9 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef WARP_DST_ATOMICS
 #define WARP_DST_ATOMICS (!TARI_GPU_HIP)
 #endif
+#if defined(TARI_ALLOW_WAVE64) && (WARP_DST_ATOMICS || FUSE_FINAL_TAIL_CURRENT || ROUND0_DST_HASH_DYNAMIC_BITS)
+#error "TARI_ALLOW_WAVE64 needs WARP_DST_ATOMICS=0 and no fused tail or round-0 hash: those use 32-lane masks"
+#endif
 #ifndef WARP_DST_ATOMICS_LATE
 #define WARP_DST_ATOMICS_LATE 0
 #endif
