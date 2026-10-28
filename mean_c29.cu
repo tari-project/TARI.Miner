@@ -150,11 +150,29 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef ROUND_TWO_LEVEL
 #define ROUND_TWO_LEVEL TARI_GPU_HIP
 #endif
+// Rounds that take the two-level write: 2 (rounds 0 and 1) or 4. Round 2
+// measured faster one-level on the R9700, and with 2 no padded chunk
+// reaches the late rounds.
+#ifndef ROUND_TWO_LEVEL_ROUNDS
+#define ROUND_TWO_LEVEL_ROUNDS 2
+#endif
+#if ROUND_TWO_LEVEL_ROUNDS != 2 && ROUND_TWO_LEVEL_ROUNDS != 4
+#error "ROUND_TWO_LEVEL_ROUNDS must be 2 or 4"
+#endif
+// Threads per block of the staged kernels. At 1024 threads (32 waves) with
+// their 33 to 41 KB of shared memory, both kernels lost 12 to 36 percent of
+// the surviving edges on a Radeon AI PRO R9700 with ROCm 7.2, run to run
+// different, while the same code at 512 threads matches the one-level
+// trimmer edge for edge and runs faster. The cause was not identified
+// (docs/amd_results_2026-10-28.md), so larger blocks are refused.
 #ifndef ROUND_ROWS_TPB
-#define ROUND_ROWS_TPB 1024
+#define ROUND_ROWS_TPB 512
 #endif
 #ifndef ROUND_COLS_TPB
 #define ROUND_COLS_TPB 512
+#endif
+#if ROUND_TWO_LEVEL && (ROUND_ROWS_TPB > 512 || ROUND_COLS_TPB > 512)
+#error "ROUND_ROWS_TPB and ROUND_COLS_TPB must be 512 or less: 32-wave staged blocks lose edges on RDNA (see the comment above)"
 #endif
 // Blocks per row in RoundCols.
 #ifndef ROUND_COLS_SPLIT
@@ -169,10 +187,16 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef ROUND_TWO_LEVEL_DIAG
 #define ROUND_TWO_LEVEL_DIAG 0
 #endif
-#if ROUND_TWO_LEVEL
+#if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4
 #define LATE_CHECK_NULL 1 // RoundCols pads its last chunks with null edges
 #else
 #define LATE_CHECK_NULL (!SKIP_LATE_NULL_CHECKS)
+#endif
+// Round 2 reads round 1's output, padded when round 1 is two-level.
+#if ROUND_TWO_LEVEL
+#define ROUND2_CHECK_NULL 1
+#else
+#define ROUND2_CHECK_NULL LATE_CHECK_NULL
 #endif
 
 #ifndef PINNED_EDGE_HOST
@@ -236,8 +260,8 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef LATE_ROUND_SELF_ZERO_IDX
 #define LATE_ROUND_SELF_ZERO_IDX 0
 #endif
-#if ROUND_TWO_LEVEL && LATE_ROUND_SELF_ZERO_IDX
-#error "ROUND_TWO_LEVEL replaces rounds 2 and 3, which LATE_ROUND_SELF_ZERO_IDX relies on"
+#if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4 && LATE_ROUND_SELF_ZERO_IDX
+#error "ROUND_TWO_LEVEL_ROUNDS=4 replaces rounds 2 and 3, which LATE_ROUND_SELF_ZERO_IDX relies on"
 #endif
 // Experimental. Each trimmer gets its own stream, and Round 0 through the
 // final count copy is launched as one CUDA graph built on first use.
@@ -1565,12 +1589,12 @@ struct edgetrimmer {
     TARI_ROUND_TIMING_BEGIN();
     memset_zero(indexesE[1], indexesSize);
 
-#if ROUND_TWO_LEVEL
+#if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4
     memset_zero(rowIdx, NX * sizeof(u32));
     RoundRows<1, EDGES_B/2, EDGES_A/4, 0><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferA, rowBuf, indexesE[0], rowIdx);
     RoundCols<EDGES_A/4, 0><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferB, rowIdx, indexesE[1]);
 #else
-    Round<1, EDGES_B/2, EDGES_A/4, 0, LATE_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
+    Round<1, EDGES_B/2, EDGES_A/4, 0, ROUND2_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
 #endif
     if (abort) return false;
     TARI_ROUND_TIMING_END(timingRound2);
@@ -1580,7 +1604,7 @@ struct edgetrimmer {
     memset_zero(indexesE[0], indexesSize);
 #endif // else Round 2 zeroed indexesE[0], its source
 
-#if ROUND_TWO_LEVEL
+#if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4
     memset_zero(rowIdx, NX * sizeof(u32));
     RoundRows<1, EDGES_A/4, EDGES_B/4, 1><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferB, rowBuf, indexesE[1], rowIdx);
     RoundCols<EDGES_B/4, 1><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferA, rowIdx, indexesE[0]);

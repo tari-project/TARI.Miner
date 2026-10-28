@@ -107,10 +107,10 @@ jobs:
             TARI_ARCH_FLAGS="-DTRIM_STAGE_TIMING=1 $flags" ./build_solver.sh amd
             mv bin/tari_c29_solver_amd "bin/variants/$name/tari_c29_solver_amd"
           done <<'VARIANTS'
-          diag1-plaincols|-DROUND_TWO_LEVEL_DIAG=1
-          diag2-plainrows|-DROUND_TWO_LEVEL_DIAG=2
-          safe|-DROUND_ROWS_TPB=512 -DROUND_COLS_SPLIT=64
-          safe-cols256|-DROUND_ROWS_TPB=512 -DROUND_COLS_SPLIT=64 -DROUND_COLS_TPB=256
+          last4|-DROUND_TWO_LEVEL_ROUNDS=4
+          split64|-DROUND_COLS_SPLIT=64
+          rows256|-DROUND_ROWS_TPB=256
+          cols256|-DROUND_COLS_TPB=256
           onelevel|-DROUND_TWO_LEVEL=0
           VARIANTS
 
@@ -187,7 +187,7 @@ jobs:
           flag_sets=(
             "-DSEEDA_CHECKPOINT=16"
             "-DLATE_ROUND_BPB=4"
-            "-DLATE_ROUND_BPB=2 -DLATE_ROUND_SELF_ZERO_IDX=1 -DROUND_LATE_TPB=512 -DROUND_TWO_LEVEL=0" # self-zero needs the one-level rounds 2 and 3
+            "-DLATE_ROUND_BPB=2 -DLATE_ROUND_SELF_ZERO_IDX=1 -DROUND_LATE_TPB=512"
             "-DROUND0_DST_HASH_DYNAMIC_BITS=12 -DROUND0_DST_HASH_FALLBACK_PLAIN=0"
             "-DWARP_DST_ATOMICS_LATE=1 -DFUSE_FINAL_TAIL_CURRENT=1 -DSKIP_LATE_NULL_CHECKS=0"
             "-DROUND_U64_EDGE_LOAD=1 -DTRIM_STAGE_TIMING=1"
