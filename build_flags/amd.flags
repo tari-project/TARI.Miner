@@ -10,11 +10,11 @@
 # WARP_DST_ATOMICS defaults to 0 under HIP (mean_c29.cu): the emulated
 # __match_any_sync in gpu_compat.h is a ballot loop that costs about 32
 # serialized cross-lane round trips per bucket store in rounds 0 to 3, and
-# with 14-bit buckets it almost never finds two lanes to merge. First
-# hardware run before that change, Radeon AI PRO R9700 (gfx1201, ROCm 7.2.2,
-# v1.1.8 release, --intensity 60 --pipeline 2): 2.37 g/s at 54 W, against
-# 12.4 g/s for lolMiner 1.98a on the same card. Set -DWARP_DST_ATOMICS=1 here
-# to measure the aggregated path again.
+# with 14-bit buckets it almost never finds two lanes to merge. Measured
+# neutral on a Radeon AI PRO R9700 (4.2 g/s either way against 12.4 g/s for
+# lolMiner): the Round kernels are bound by their scattered 8-byte bucket
+# stores, which no option here changes. Full numbers, the sweep of the other
+# options and the fix they point at: docs/amd_results_2026-10-28.md.
 #
 # Shared memory: an AMD workgroup has 64 KB. The defaults fit. Two options can
 # exceed it, and the HIP build rejects them at compile time:

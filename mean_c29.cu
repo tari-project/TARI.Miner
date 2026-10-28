@@ -71,7 +71,9 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 // ballot loop that runs once per distinct bucket in the wave: with 14-bit
 // buckets the 32 lanes are nearly always distinct, so every store in rounds
 // 0 to 3 pays about 32 serialized ds_bpermute round trips to aggregate
-// nothing. The AMD build takes one plain atomic per edge instead.
+// nothing. The AMD build takes one plain atomic per edge instead. Measured
+// neutral on an R9700: the scattered 8-byte bucket stores dominate those
+// rounds there (docs/amd_results_2026-10-28.md).
 #ifndef WARP_DST_ATOMICS
 #define WARP_DST_ATOMICS (!TARI_GPU_HIP)
 #endif
