@@ -78,6 +78,16 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef WARP_DST_ATOMICS_LATE
 #define WARP_DST_ATOMICS_LATE 0
 #endif
+// Edge loads each thread issues before it waits on the first, in both passes
+// of Round. 1 is the original loop, which keeps one load in flight per warp.
+// Larger values batch the loads (the *_COUNT_NORMAL_LOAD options do not
+// apply to the batched first pass). Experimental, for the AMD sweep.
+#ifndef ROUND_MLP
+#define ROUND_MLP 1
+#endif
+#if ROUND_MLP < 1 || ROUND_MLP > 16
+#error "ROUND_MLP must be 1 to 16"
+#endif
 
 #ifndef ROUND_U64_EDGE_LOAD
 #define ROUND_U64_EDGE_LOAD 0
@@ -644,6 +654,27 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
     // if (!group && !lid) printf("round %d size  %d\n", round, edgesInBucket);
     const int loops = (edgesInBucket + dim-1) / dim;
 
+#if ROUND_MLP > 1
+    for (int loop = 0; loop < loops; loop += ROUND_MLP) {
+      uint2 edges[ROUND_MLP];
+#pragma unroll
+      for (int u = 0; u < ROUND_MLP; u++) {
+        const int lindex = min((loop + u) * dim + lid, edgesInBucket - 1);
+        edges[u] = LoadRoundEdge(src, maxIn * group + lindex);
+      }
+#pragma unroll
+      for (int u = 0; u < ROUND_MLP; u++) {
+        const int lindex = (loop + u) * dim + lid;
+        if (lindex >= edgesInBucket) continue;
+        const uint2 edge = edges[u];
+        if constexpr (CHECK_NULL) {
+          if (null(edge)) continue;
+        }
+        u32 node = UORV ? edge.y : edge.x;
+        Increase2bCounter(ecounters, node & ZMASK);
+      }
+    }
+#else
     for (int loop = 0; loop < loops; loop++) {
       const int lindex = loop * dim + lid;
       if (lindex < edgesInBucket) {
@@ -668,6 +699,7 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
         Increase2bCounter(ecounters, node & ZMASK);
       }
     }
+#endif
   }
 
   __syncthreads();
@@ -676,6 +708,53 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
   for (int i = 0; i < NP; i++, src += NX2 * maxIn, srcIdx += NX2) {
     const int edgesInBucket = min(srcIdx[group], maxIn);
     const int loops = (edgesInBucket + dim-1) / dim;
+#if ROUND_MLP > 1
+    for (int loop = 0; loop < loops; loop += ROUND_MLP) {
+      uint2 edges[ROUND_MLP];
+#pragma unroll
+      for (int u = 0; u < ROUND_MLP; u++) {
+        const int lindex = min((loop + u) * dim + lid, edgesInBucket - 1);
+        edges[u] = LoadRoundEdge(src, maxIn * group + lindex);
+      }
+#pragma unroll
+      for (int u = 0; u < ROUND_MLP; u++) {
+      const int lindex = (loop + u) * dim + lid;
+      if (lindex < edgesInBucket) {
+        const uint2 edge = edges[u];
+        if constexpr (CHECK_NULL) {
+          if (null(edge)) continue;
+        }
+        u32 node0 = UORV ? edge.y : edge.x;
+        if (Read2bCounter(ecounters, node0 & ZMASK)) {
+          u32 node1 = UORV ? edge.x : edge.y;
+          const int bucket = node1 >> ZBITS;
+          const uint2 outEdge = UORV ? make_uint2(node1, node0) : make_uint2(node0, node1);
+#if WARP_DST_ATOMICS
+          if constexpr (maxIn > EDGES_B/4 || WARP_DST_ATOMICS_LATE) {
+          const unsigned lane = threadIdx.x & 31;
+          const unsigned mask = tari_match_any_sync(tari_activemask(), bucket);
+          const unsigned rank = __popc(mask & ((1u << lane) - 1));
+          const unsigned count = __popc(mask);
+          const unsigned leader = __ffs(mask) - 1;
+          u32 base = 0;
+          if (lane == leader)
+            base = atomicAdd(dstIdx + bucket, count);
+          base = tari_shfl_sync(mask, base, leader);
+          const u32 bktIdx = min(base + rank, (u32)(maxOut - 1));
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+          } else {
+          const int bktIdx = min(atomicAdd(dstIdx + bucket, 1), maxOut - 1);
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+          }
+#else
+          const int bktIdx = min(atomicAdd(dstIdx + bucket, 1), maxOut - 1);
+          StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+#endif
+        }
+      }
+    }
+    }
+#else
     for (int loop = 0; loop < loops; loop++) {
       const int lindex = loop * dim + lid;
       if (lindex < edgesInBucket) {
@@ -713,6 +792,7 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
         }
       }
     }
+#endif
   }
 
   if constexpr (ZERO_SRC_IDX != 0) {
