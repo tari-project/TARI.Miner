@@ -93,6 +93,29 @@ jobs:
         run: |
           "$HIPCC" --version
 
+      # Tuning candidates for the first AMD sweep, gfx1201 only, each with
+      # stage timing so a run reports where the time went. Existing options,
+      # no kernel changes. Dropped once build_flags/amd.flags is settled.
+      - name: Build AMD tuning variants for gfx1201
+        env:
+          AMD_OFFLOAD_ARCHES: gfx1201
+        run: |
+          set -euo pipefail
+          while IFS='|' read -r name flags; do
+            [[ -z "$name" ]] && continue
+            mkdir -p "bin/variants/$name"
+            TARI_ARCH_FLAGS="-DTRIM_STAGE_TIMING=1 $flags" ./build_solver.sh amd
+            mv bin/tari_c29_solver_amd "bin/variants/$name/tari_c29_solver_amd"
+          done <<'VARIANTS'
+          tpb256|-DROUND0_TPB=256 -DROUND1_TPB=256 -DROUND23_TPB=256
+          tpb512|-DROUND0_TPB=512 -DROUND1_TPB=512 -DROUND23_TPB=512
+          selfzero|-DLATE_ROUND_SELF_ZERO_IDX=1
+          bpb4|-DLATE_ROUND_BPB=4
+          bpb4-selfzero-tpb512|-DLATE_ROUND_BPB=4 -DLATE_ROUND_SELF_ZERO_IDX=1 -DROUND_LATE_TPB=512
+          dsthash12|-DROUND0_DST_HASH_DYNAMIC_BITS=12 -DROUND0_DST_HASH_DYNAMIC_PROBES=4 -DROUND0_DST_HASH_FALLBACK_PLAIN=1 -DROUND0_DST_HASH_REPLAY_NORMAL_LOAD=1 -DROUND0_DST_HASH_REVERSE_INSERT=1
+          normalload|-DROUND_U64_EDGE_LOAD=1 -DROUND1_COUNT_NORMAL_LOAD=1 -DROUND23_COUNT_NORMAL_LOAD=1
+          VARIANTS
+
       - name: Build solver and pool miner for amd
         run: |
           set -euo pipefail
@@ -116,6 +139,7 @@ jobs:
             bin/tari_c29_solver_amd
             bin/validation/tari_c29_solver_amd_reference
             bin/timing/tari_c29_solver_amd
+            bin/variants/*/tari_c29_solver_amd
           if-no-files-found: error
           retention-days: 14
 
