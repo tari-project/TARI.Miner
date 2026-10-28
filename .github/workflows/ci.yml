@@ -107,13 +107,11 @@ jobs:
             TARI_ARCH_FLAGS="-DTRIM_STAGE_TIMING=1 $flags" ./build_solver.sh amd
             mv bin/tari_c29_solver_amd "bin/variants/$name/tari_c29_solver_amd"
           done <<'VARIANTS'
+          diag1-plaincols|-DROUND_TWO_LEVEL_DIAG=1
+          diag2-plainrows|-DROUND_TWO_LEVEL_DIAG=2
+          safe|-DROUND_ROWS_TPB=512 -DROUND_COLS_SPLIT=64
+          safe-cols256|-DROUND_ROWS_TPB=512 -DROUND_COLS_SPLIT=64 -DROUND_COLS_TPB=256
           onelevel|-DROUND_TWO_LEVEL=0
-          rows512|-DROUND_ROWS_TPB=512
-          cols256|-DROUND_COLS_TPB=256
-          cols1024|-DROUND_COLS_TPB=1024
-          split16|-DROUND_COLS_SPLIT=16
-          split64|-DROUND_COLS_SPLIT=64
-          flush4|-DROUND_FLUSH=4
           VARIANTS
 
       - name: Build solver and pool miner for amd

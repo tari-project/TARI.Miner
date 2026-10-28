@@ -164,6 +164,11 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef ROUND_FLUSH
 #define ROUND_FLUSH 8
 #endif
+// Diagnostic only: 1 makes RoundCols store each edge directly, 2 makes
+// RoundRows store each edge directly, both without staging.
+#ifndef ROUND_TWO_LEVEL_DIAG
+#define ROUND_TWO_LEVEL_DIAG 0
+#endif
 #if ROUND_TWO_LEVEL
 #define LATE_CHECK_NULL 1 // RoundCols pads its last chunks with null edges
 #else
@@ -923,6 +928,10 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
           if (Read2bCounter(ecounters, node0 & ZMASK)) {
             const u32 node1 = UORV ? edge.x : edge.y;
             row = node1 >> YZBITS;
+#if ROUND_TWO_LEVEL_DIAG == 2
+            const u32 at = min(atomicAdd(rowIdx + row, 1u), ROWCAP - 1);
+            reinterpret_cast<uint2 *>(rows)[(u64)row * ROWCAP + at] = edge;
+#else
             counter = atomicAdd(counters + row, 1);
             if (counter < FLUSH2) {
               tmp[row][counter] = edge;
@@ -931,6 +940,7 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
               rows[((u64)row * ROWCAP + at) / PERLL4] = PaddedChunk(edge);
               counter = -1;
             }
+#endif
           }
         }
       }
@@ -996,6 +1006,11 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
       if (!null(edge)) {
         const u32 node1 = UORV ? edge.x : edge.y;
         col = (node1 >> ZBITS) & XMASK;
+#if ROUND_TWO_LEVEL_DIAG == 1
+        const u32 grp = row * NY + col;
+        const u32 at = min(atomicAdd(dstIdx + grp, 1u), (u32)(maxOut - 1));
+        reinterpret_cast<uint2 *>(dst)[(u64)grp * maxOut + at] = edge;
+#else
         counter = atomicAdd(counters + col, 1);
         if (counter < FLUSH2) {
           tmp[col][counter] = edge;
@@ -1005,6 +1020,7 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
           dst[((u64)grp * maxOut + at) / PERLL4] = PaddedChunk(edge);
           counter = -1;
         }
+#endif
       }
     }
     __syncthreads();
