@@ -899,6 +899,60 @@ constexpr int ROUND_FLUSH2 = 4 * ROUND_FLUSH;              // staging depth per 
 constexpr int EDGES_PER_LL4 = sizeof(ulonglong4) / sizeof(uint2);
 static_assert(ROUND_FLUSH % EDGES_PER_LL4 == 0, "ROUND_FLUSH must be a multiple of 4");
 
+// Bisect switches for the staged kernels (diagnostic): each replaces one
+// thing the exact OpenCL port of RoundRows does differently.
+//   TARI_RR_LDS_BARRIER   barrier with shared-memory fences only, no global
+//                         fence or cache invalidate
+//   TARI_RR_NO_RESTRICT   no __restrict__ on the kernel pointers
+//   TARI_RR_PLAIN_LOAD    plain loads instead of __ldg
+//   TARI_RR_UINT4_STORE   uint4 stores instead of ulonglong4
+#ifndef TARI_RR_LDS_BARRIER
+#define TARI_RR_LDS_BARRIER 0
+#endif
+#ifndef TARI_RR_NO_RESTRICT
+#define TARI_RR_NO_RESTRICT 0
+#endif
+#ifndef TARI_RR_PLAIN_LOAD
+#define TARI_RR_PLAIN_LOAD 0
+#endif
+#ifndef TARI_RR_UINT4_STORE
+#define TARI_RR_UINT4_STORE 0
+#endif
+#if TARI_RR_LDS_BARRIER && TARI_GPU_HIP
+#define RR_SYNC() do { __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local"); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local"); } while (0)
+#else
+#define RR_SYNC() __syncthreads()
+#endif
+#if TARI_RR_NO_RESTRICT
+#define RR_RESTRICT
+#else
+#define RR_RESTRICT __restrict__
+#endif
+#if TARI_RR_PLAIN_LOAD
+#define RR_LOAD(src, index) ((src)[index])
+#else
+#define RR_LOAD(src, index) LoadRoundEdge(src, index)
+#endif
+#if TARI_RR_UINT4_STORE
+__device__ __forceinline__ void StoreChunk(ulonglong4 *dst, const u64 index, const uint2 *lds) {
+  uint4 *d = reinterpret_cast<uint4 *>(dst + index);
+  d[0] = make_uint4(lds[0].x, lds[0].y, lds[1].x, lds[1].y);
+  d[1] = make_uint4(lds[2].x, lds[2].y, lds[3].x, lds[3].y);
+}
+__device__ __forceinline__ void StorePadded(ulonglong4 *dst, const u64 index, const uint2 edge) {
+  uint4 *d = reinterpret_cast<uint4 *>(dst + index);
+  d[0] = make_uint4(edge.x, edge.y, 0, 0);
+  d[1] = make_uint4(0, 0, 0, 0);
+}
+#else
+__device__ __forceinline__ void StoreChunk(ulonglong4 *dst, const u64 index, const uint2 *lds) {
+  dst[index] = *reinterpret_cast<const ulonglong4 *>(lds);
+}
+__device__ __forceinline__ void StorePadded(ulonglong4 *dst, const u64 index, const uint2 edge) {
+  dst[index] = make_ulonglong4(((u64)edge.y << 32) | edge.x, 0, 0, 0);
+}
+#endif
+
 // Clears the row counts on the stream, ahead of RoundRows. A kernel rather
 // than a memset so the ordering with the surrounding kernels is beyond
 // doubt on every runtime.
@@ -915,8 +969,8 @@ __device__ __forceinline__ ulonglong4 PaddedChunk(const uint2 edge) {
 // NX rows of ROWCAP edges, through shared-memory staging. rowIdx counts
 // each row and must be zero on entry.
 template<int NP, int maxIn, int maxOut, int UORV>
-__global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restrict__ rows,
-                          const u32 * __restrict__ srcIdx, u32 * __restrict__ rowIdx) {
+__global__ void RoundRows(const uint2 * RR_RESTRICT src, ulonglong4 * RR_RESTRICT rows,
+                          const u32 * RR_RESTRICT srcIdx, u32 * RR_RESTRICT rowIdx) {
   const int group = blockIdx.x;
   const int dim = blockDim.x;
   const int lid = threadIdx.x;
@@ -932,7 +986,7 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
     ecounters[i] = 0;
   for (int i = lid; i < NX; i += dim)
     counters[i] = 0;
-  __syncthreads();
+  RR_SYNC();
 
   for (int i = 0; i < NP; i++, src += NX2 * maxIn, srcIdx += NX2) {
     const int edgesInBucket = min(srcIdx[group], maxIn);
@@ -940,14 +994,14 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
     for (int loop = 0; loop < loops; loop++) {
       const int lindex = loop * dim + lid;
       if (lindex < edgesInBucket) {
-        const uint2 edge = LoadRoundEdge(src, maxIn * group + lindex);
+        const uint2 edge = RR_LOAD(src, maxIn * group + lindex);
         if (null(edge)) continue;
         const u32 node = UORV ? edge.y : edge.x;
         Increase2bCounter(ecounters, node & ZMASK);
       }
     }
   }
-  __syncthreads();
+  RR_SYNC();
 
   src -= NP * NX2 * maxIn; srcIdx -= NP * NX2;
   for (int i = 0; i < NP; i++, src += NX2 * maxIn, srcIdx += NX2) {
@@ -957,7 +1011,7 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
       const int lindex = loop * dim + lid;
       int row = -1, counter = -1;
       if (lindex < edgesInBucket) {
-        const uint2 edge = LoadRoundEdge(src, maxIn * group + lindex);
+        const uint2 edge = RR_LOAD(src, maxIn * group + lindex);
         if (!null(edge)) {
           const u32 node0 = UORV ? edge.y : edge.x;
           if (Read2bCounter(ecounters, node0 & ZMASK)) {
@@ -972,26 +1026,26 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
               tmp[row][counter] = edge;
             } else {
               const u32 at = min(atomicAdd(rowIdx + row, (u32)PERLL4), ROWCAP - PERLL4);
-              rows[((u64)row * ROWCAP + at) / PERLL4] = PaddedChunk(edge);
+              StorePadded(rows, ((u64)row * ROWCAP + at) / PERLL4, edge);
               counter = -1;
             }
 #endif
           }
         }
       }
-      __syncthreads();
+      RR_SYNC();
       if (counter == ROUND_FLUSH - 1) {
         const int localIdx = min(FLUSH2, counters[row]);
         const int newCount = localIdx % ROUND_FLUSH;
         const int nflush = localIdx - newCount;
         const u32 cnt = min(atomicAdd(rowIdx + row, (u32)nflush), ROWCAP - nflush);
         for (int k = 0; k < nflush; k += PERLL4)
-          rows[((u64)row * ROWCAP + cnt + k) / PERLL4] = *(ulonglong4 *)(&tmp[row][k]);
+          StoreChunk(rows, ((u64)row * ROWCAP + cnt + k) / PERLL4, &tmp[row][k]);
         for (int t = 0; t < newCount; t++)
           tmp[row][t] = tmp[row][t + nflush];
         counters[row] = newCount;
       }
-      __syncthreads();
+      RR_SYNC();
     }
   }
 
@@ -1002,7 +1056,7 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
       tmp[row][j] = zero;
     for (int k = 0; k < localIdx; k += PERLL4) {
       const u32 cnt = min(atomicAdd(rowIdx + row, (u32)PERLL4), ROWCAP - PERLL4);
-      rows[((u64)row * ROWCAP + cnt) / PERLL4] = *(ulonglong4 *)(&tmp[row][k]);
+      StoreChunk(rows, ((u64)row * ROWCAP + cnt) / PERLL4, &tmp[row][k]);
     }
   }
 }
@@ -1011,8 +1065,8 @@ __global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restric
 // ROUND_COLS_SPLIT blocks per row. Output layout and counts are those of
 // Round, with null padding at chunk ends.
 template<int maxOut, int UORV>
-__global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restrict__ dst,
-                          const u32 * __restrict__ rowIdx, u32 * __restrict__ dstIdx) {
+__global__ void RoundCols(const uint2 * RR_RESTRICT rows, ulonglong4 * RR_RESTRICT dst,
+                          const u32 * RR_RESTRICT rowIdx, u32 * RR_RESTRICT dstIdx) {
   const int dim = blockDim.x;
   const int lid = threadIdx.x;
   constexpr u32 ROWCAP = NY * maxOut;
@@ -1026,7 +1080,7 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
   __shared__ int counters[NY];
   for (int i = lid; i < NY; i += dim)
     counters[i] = 0;
-  __syncthreads();
+  RR_SYNC();
 
   const u32 rowEdges = min(rowIdx[row], ROWCAP);
   const u32 begin = min((u32)part * CHUNK, rowEdges);
@@ -1037,7 +1091,7 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
     const u32 k = begin + loop * dim + lid;
     int col = -1, counter = -1;
     if (k < end) {
-      const uint2 edge = __ldg(&in[k]);
+      const uint2 edge = RR_LOAD(in, k);
       if (!null(edge)) {
         const u32 node1 = UORV ? edge.x : edge.y;
         col = (node1 >> ZBITS) & XMASK;
@@ -1052,13 +1106,13 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
         } else {
           const u32 grp = row * NY + col;
           const u32 at = min(atomicAdd(dstIdx + grp, (u32)PERLL4), (u32)(maxOut - PERLL4));
-          dst[((u64)grp * maxOut + at) / PERLL4] = PaddedChunk(edge);
+          StorePadded(dst, ((u64)grp * maxOut + at) / PERLL4, edge);
           counter = -1;
         }
 #endif
       }
     }
-    __syncthreads();
+    RR_SYNC();
     if (counter == ROUND_FLUSH - 1) {
       const int localIdx = min(FLUSH2, counters[col]);
       const int newCount = localIdx % ROUND_FLUSH;
@@ -1066,12 +1120,12 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
       const u32 grp = row * NY + col;
       const u32 cnt = min(atomicAdd(dstIdx + grp, (u32)nflush), (u32)(maxOut - nflush));
       for (int t = 0; t < nflush; t += PERLL4)
-        dst[((u64)grp * maxOut + cnt + t) / PERLL4] = *(ulonglong4 *)(&tmp[col][t]);
+        StoreChunk(dst, ((u64)grp * maxOut + cnt + t) / PERLL4, &tmp[col][t]);
       for (int t = 0; t < newCount; t++)
         tmp[col][t] = tmp[col][t + nflush];
       counters[col] = newCount;
     }
-    __syncthreads();
+    RR_SYNC();
   }
 
   const uint2 zero = make_uint2(0, 0);
@@ -1082,7 +1136,7 @@ __global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restri
       tmp[col][j] = zero;
     for (int t = 0; t < localIdx; t += PERLL4) {
       const u32 cnt = min(atomicAdd(dstIdx + grp, (u32)PERLL4), (u32)(maxOut - PERLL4));
-      dst[((u64)grp * maxOut + cnt) / PERLL4] = *(ulonglong4 *)(&tmp[col][t]);
+      StoreChunk(dst, ((u64)grp * maxOut + cnt) / PERLL4, &tmp[col][t]);
     }
   }
 }
