@@ -137,6 +137,39 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #define SKIP_LATE_NULL_CHECKS 1
 #endif
 
+// Two-level destination write for rounds 0 to 3. Round's second pass stores
+// each surviving edge straight into one of NX2 buckets, 8 bytes at a time.
+// RDNA does not combine that many write streams: on a Radeon AI PRO R9700
+// that store is 60 of Round 0's 72 ms (docs/amd_results_2026-10-28.md).
+// RoundRows does Round's counting and filtering but stages survivors in
+// shared memory by destination row (x of the other endpoint) and flushes
+// them in 32-byte chunks to a row buffer, as SeedA does; RoundCols then reads
+// each row and scatters it into the row's NY buckets the same way, as SeedB
+// does. Partial chunks are padded with null edges, which every later round
+// skips. Costs one extra buffer of sizeB/NB per context.
+#ifndef ROUND_TWO_LEVEL
+#define ROUND_TWO_LEVEL TARI_GPU_HIP
+#endif
+#ifndef ROUND_ROWS_TPB
+#define ROUND_ROWS_TPB 1024
+#endif
+#ifndef ROUND_COLS_TPB
+#define ROUND_COLS_TPB 512
+#endif
+// Blocks per row in RoundCols.
+#ifndef ROUND_COLS_SPLIT
+#define ROUND_COLS_SPLIT 32
+#endif
+// Edges per flush; the staging depth per destination is four times this.
+#ifndef ROUND_FLUSH
+#define ROUND_FLUSH 8
+#endif
+#if ROUND_TWO_LEVEL
+#define LATE_CHECK_NULL 1 // RoundCols pads its last chunks with null edges
+#else
+#define LATE_CHECK_NULL (!SKIP_LATE_NULL_CHECKS)
+#endif
+
 #ifndef PINNED_EDGE_HOST
 #define PINNED_EDGE_HOST 1
 #endif
@@ -197,6 +230,9 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 // counts once they have read them, replacing the per-round index memsets.
 #ifndef LATE_ROUND_SELF_ZERO_IDX
 #define LATE_ROUND_SELF_ZERO_IDX 0
+#endif
+#if ROUND_TWO_LEVEL && LATE_ROUND_SELF_ZERO_IDX
+#error "ROUND_TWO_LEVEL replaces rounds 2 and 3, which LATE_ROUND_SELF_ZERO_IDX relies on"
 #endif
 // Experimental. Each trimmer gets its own stream, and Round 0 through the
 // final count copy is launched as one CUDA graph built on first use.
@@ -825,6 +861,182 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
   }
 }
 
+#if ROUND_TWO_LEVEL
+constexpr int ROUND_FLUSH2 = 4 * ROUND_FLUSH;              // staging depth per destination
+constexpr int EDGES_PER_LL4 = sizeof(ulonglong4) / sizeof(uint2);
+static_assert(ROUND_FLUSH % EDGES_PER_LL4 == 0, "ROUND_FLUSH must be a multiple of 4");
+
+// One edge as a padded 32-byte chunk, for the rare staging overflow.
+__device__ __forceinline__ ulonglong4 PaddedChunk(const uint2 edge) {
+  return make_ulonglong4(((u64)edge.y << 32) | edge.x, 0, 0, 0);
+}
+
+// Round's two passes, with the second pass writing survivors to `rows`,
+// NX rows of ROWCAP edges, through shared-memory staging. rowIdx counts
+// each row and must be zero on entry.
+template<int NP, int maxIn, int maxOut, int UORV>
+__global__ void RoundRows(const uint2 * __restrict__ src, ulonglong4 * __restrict__ rows,
+                          const u32 * __restrict__ srcIdx, u32 * __restrict__ rowIdx) {
+  const int group = blockIdx.x;
+  const int dim = blockDim.x;
+  const int lid = threadIdx.x;
+  constexpr u32 ROWCAP = NY * maxOut;
+  constexpr int FLUSH2 = ROUND_FLUSH2;
+  constexpr int PERLL4 = EDGES_PER_LL4;
+
+  __shared__ u32 ecounters[ROUND_COUNTER_WORDS];
+  __shared__ TARI_LDS_ALIGN_ULL4 uint2 tmp[NX][FLUSH2];
+  __shared__ int counters[NX];
+
+  for (int i = lid; i < ROUND_COUNTER_WORDS; i += dim)
+    ecounters[i] = 0;
+  for (int i = lid; i < NX; i += dim)
+    counters[i] = 0;
+  __syncthreads();
+
+  for (int i = 0; i < NP; i++, src += NX2 * maxIn, srcIdx += NX2) {
+    const int edgesInBucket = min(srcIdx[group], maxIn);
+    const int loops = (edgesInBucket + dim-1) / dim;
+    for (int loop = 0; loop < loops; loop++) {
+      const int lindex = loop * dim + lid;
+      if (lindex < edgesInBucket) {
+        const uint2 edge = LoadRoundEdge(src, maxIn * group + lindex);
+        if (null(edge)) continue;
+        const u32 node = UORV ? edge.y : edge.x;
+        Increase2bCounter(ecounters, node & ZMASK);
+      }
+    }
+  }
+  __syncthreads();
+
+  src -= NP * NX2 * maxIn; srcIdx -= NP * NX2;
+  for (int i = 0; i < NP; i++, src += NX2 * maxIn, srcIdx += NX2) {
+    const int edgesInBucket = min(srcIdx[group], maxIn);
+    const int loops = (edgesInBucket + dim-1) / dim;
+    for (int loop = 0; loop < loops; loop++) {
+      const int lindex = loop * dim + lid;
+      int row = -1, counter = -1;
+      if (lindex < edgesInBucket) {
+        const uint2 edge = LoadRoundEdge(src, maxIn * group + lindex);
+        if (!null(edge)) {
+          const u32 node0 = UORV ? edge.y : edge.x;
+          if (Read2bCounter(ecounters, node0 & ZMASK)) {
+            const u32 node1 = UORV ? edge.x : edge.y;
+            row = node1 >> YZBITS;
+            counter = atomicAdd(counters + row, 1);
+            if (counter < FLUSH2) {
+              tmp[row][counter] = edge;
+            } else {
+              const u32 at = min(atomicAdd(rowIdx + row, (u32)PERLL4), ROWCAP - PERLL4);
+              rows[((u64)row * ROWCAP + at) / PERLL4] = PaddedChunk(edge);
+              counter = -1;
+            }
+          }
+        }
+      }
+      __syncthreads();
+      if (counter == ROUND_FLUSH - 1) {
+        const int localIdx = min(FLUSH2, counters[row]);
+        const int newCount = localIdx % ROUND_FLUSH;
+        const int nflush = localIdx - newCount;
+        const u32 cnt = min(atomicAdd(rowIdx + row, (u32)nflush), ROWCAP - nflush);
+        for (int k = 0; k < nflush; k += PERLL4)
+          rows[((u64)row * ROWCAP + cnt + k) / PERLL4] = *(ulonglong4 *)(&tmp[row][k]);
+        for (int t = 0; t < newCount; t++)
+          tmp[row][t] = tmp[row][t + nflush];
+        counters[row] = newCount;
+      }
+      __syncthreads();
+    }
+  }
+
+  const uint2 zero = make_uint2(0, 0);
+  for (int row = lid; row < NX; row += dim) {
+    const int localIdx = min(FLUSH2, counters[row]);
+    for (int j = localIdx; j % PERLL4; j++)
+      tmp[row][j] = zero;
+    for (int k = 0; k < localIdx; k += PERLL4) {
+      const u32 cnt = min(atomicAdd(rowIdx + row, (u32)PERLL4), ROWCAP - PERLL4);
+      rows[((u64)row * ROWCAP + cnt) / PERLL4] = *(ulonglong4 *)(&tmp[row][k]);
+    }
+  }
+}
+
+// Scatters one row of RoundRows' output into the row's NY buckets of dst,
+// ROUND_COLS_SPLIT blocks per row. Output layout and counts are those of
+// Round, with null padding at chunk ends.
+template<int maxOut, int UORV>
+__global__ void RoundCols(const uint2 * __restrict__ rows, ulonglong4 * __restrict__ dst,
+                          const u32 * __restrict__ rowIdx, u32 * __restrict__ dstIdx) {
+  const int dim = blockDim.x;
+  const int lid = threadIdx.x;
+  constexpr u32 ROWCAP = NY * maxOut;
+  constexpr u32 CHUNK = (ROWCAP + ROUND_COLS_SPLIT - 1) / ROUND_COLS_SPLIT;
+  constexpr int FLUSH2 = ROUND_FLUSH2;
+  constexpr int PERLL4 = EDGES_PER_LL4;
+  const int row = blockIdx.x / ROUND_COLS_SPLIT;
+  const int part = blockIdx.x % ROUND_COLS_SPLIT;
+
+  __shared__ TARI_LDS_ALIGN_ULL4 uint2 tmp[NY][FLUSH2];
+  __shared__ int counters[NY];
+  for (int i = lid; i < NY; i += dim)
+    counters[i] = 0;
+  __syncthreads();
+
+  const u32 rowEdges = min(rowIdx[row], ROWCAP);
+  const u32 begin = min((u32)part * CHUNK, rowEdges);
+  const u32 end = min(begin + CHUNK, rowEdges);
+  const uint2 *in = rows + (u64)row * ROWCAP;
+  const int loops = (int)(end - begin + dim - 1) / dim;
+  for (int loop = 0; loop < loops; loop++) {
+    const u32 k = begin + loop * dim + lid;
+    int col = -1, counter = -1;
+    if (k < end) {
+      const uint2 edge = __ldg(&in[k]);
+      if (!null(edge)) {
+        const u32 node1 = UORV ? edge.x : edge.y;
+        col = (node1 >> ZBITS) & XMASK;
+        counter = atomicAdd(counters + col, 1);
+        if (counter < FLUSH2) {
+          tmp[col][counter] = edge;
+        } else {
+          const u32 grp = row * NY + col;
+          const u32 at = min(atomicAdd(dstIdx + grp, (u32)PERLL4), (u32)(maxOut - PERLL4));
+          dst[((u64)grp * maxOut + at) / PERLL4] = PaddedChunk(edge);
+          counter = -1;
+        }
+      }
+    }
+    __syncthreads();
+    if (counter == ROUND_FLUSH - 1) {
+      const int localIdx = min(FLUSH2, counters[col]);
+      const int newCount = localIdx % ROUND_FLUSH;
+      const int nflush = localIdx - newCount;
+      const u32 grp = row * NY + col;
+      const u32 cnt = min(atomicAdd(dstIdx + grp, (u32)nflush), (u32)(maxOut - nflush));
+      for (int t = 0; t < nflush; t += PERLL4)
+        dst[((u64)grp * maxOut + cnt + t) / PERLL4] = *(ulonglong4 *)(&tmp[col][t]);
+      for (int t = 0; t < newCount; t++)
+        tmp[col][t] = tmp[col][t + nflush];
+      counters[col] = newCount;
+    }
+    __syncthreads();
+  }
+
+  const uint2 zero = make_uint2(0, 0);
+  for (int col = lid; col < NY; col += dim) {
+    const int localIdx = min(FLUSH2, counters[col]);
+    const u32 grp = row * NY + col;
+    for (int j = localIdx; j % PERLL4; j++)
+      tmp[col][j] = zero;
+    for (int t = 0; t < localIdx; t += PERLL4) {
+      const u32 cnt = min(atomicAdd(dstIdx + grp, (u32)PERLL4), (u32)(maxOut - PERLL4));
+      dst[((u64)grp * maxOut + cnt) / PERLL4] = *(ulonglong4 *)(&tmp[col][t]);
+    }
+  }
+}
+#endif // ROUND_TWO_LEVEL
+
 #if LATE_ROUND_BPB > 1
 // Shared memory words for RoundMulti: two bitmaps of BPB * NZ bits.
 __host__ __device__ constexpr int MultiCounterWords(const int bpb) {
@@ -1091,6 +1303,13 @@ struct edgetrimmer {
   u8 *bufferB = nullptr;
   u8 *bufferAB = nullptr;
   u32 *indexesE[1+NB] = {};
+#if ROUND_TWO_LEVEL
+  ulonglong4 *rowBuf = nullptr; // RoundRows output: NX rows of NY * maxOut edges
+  u32 *rowIdx = nullptr;        // edges per row
+  static constexpr u64 ROW_BUF_MAX_OUT = EDGES_B/NB > EDGES_B/2 ? EDGES_B/NB : EDGES_B/2;
+  static constexpr u64 rowBytes = (u64)NX2 * ROW_BUF_MAX_OUT * sizeof(uint2);
+  static_assert(EDGES_A/4 <= ROW_BUF_MAX_OUT && EDGES_B/4 <= ROW_BUF_MAX_OUT, "row buffer must hold every two-level round");
+#endif
   u32 nedges = 0;
   cudaError_t trim_error = cudaSuccess;
   siphash_keys sipkeys;
@@ -1119,6 +1338,10 @@ struct edgetrimmer {
     const size_t bufferSize = sizeA + sizeB / NB;
     assert(bufferSize >= sizeB + sizeB / NB / 2); // ensure enough space for Round 1
     checkCudaErrors_V(cudaMalloc((void**)&bufferA, bufferSize));
+#if ROUND_TWO_LEVEL
+    checkCudaErrors_V(cudaMalloc((void**)&rowBuf, rowBytes));
+    checkCudaErrors_V(cudaMalloc((void**)&rowIdx, NX * sizeof(u32)));
+#endif
     bufferAB = bufferA + sizeB / NB;
     bufferB  = bufferA + bufferSize - sizeB;
     assert(bufferA + sizeA == bufferB + sizeB * (NB-1) / NB); // ensure alignment of overlap
@@ -1132,10 +1355,10 @@ struct edgetrimmer {
 #endif
 #if LATE_ROUND_BPB > 1
     assert(tp.trim.blocks % LATE_ROUND_BPB == 0);
-    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
+    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 0, LATE_CHECK_NULL, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            LATE_ROUND_MULTI_SMEM));
-    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
+    checkCudaErrors_V(cudaFuncSetAttribute(RoundMulti<EDGES_B/4, EDGES_B/4, 1, LATE_CHECK_NULL, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX>,
                                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                                            LATE_ROUND_MULTI_SMEM));
 #endif
@@ -1143,7 +1366,11 @@ struct edgetrimmer {
     initsuccess = true;
   }
   u64 globalbytes() const {
-    return (sizeA+sizeB/NB) + (1+NB) * indexesSize + sizeof(edgetrimmer);
+    u64 bytes = (sizeA+sizeB/NB) + (1+NB) * indexesSize + sizeof(edgetrimmer);
+#if ROUND_TWO_LEVEL
+    bytes += rowBytes + NX * sizeof(u32);
+#endif
+    return bytes;
   }
   ~edgetrimmer() {
 #if TRIM_CUDA_GRAPH
@@ -1156,6 +1383,12 @@ struct edgetrimmer {
 #endif
     if (bufferA)
       checkCudaErrors_V(cudaFree(bufferA));
+#if ROUND_TWO_LEVEL
+    if (rowBuf)
+      checkCudaErrors_V(cudaFree(rowBuf));
+    if (rowIdx)
+      checkCudaErrors_V(cudaFree(rowIdx));
+#endif
     for (int i = 0; i < 1+NB; i++) {
       if (indexesE[i])
         checkCudaErrors_V(cudaFree(indexesE[i]));
@@ -1287,7 +1520,11 @@ struct edgetrimmer {
     const size_t qB = sizeB/NB;
     qE = NX2 / NB;
     for (u32 i = NB; i--; ) {
-#if ROUND0_DST_HASH_DYNAMIC_BITS
+#if ROUND_TWO_LEVEL
+      memset_zero(rowIdx, NX * sizeof(u32));
+      RoundRows<1, EDGES_A, EDGES_B/NB, 0><<<tp.trim.blocks/NB, ROUND_ROWS_TPB, 0, stream>>>((const uint2*)(bufferA+i*qA), rowBuf, indexesE[0]+i*qE, rowIdx);
+      RoundCols<EDGES_B/NB, 0><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4*)(bufferB+i*qB), rowIdx, indexesE[1+i]);
+#elif ROUND0_DST_HASH_DYNAMIC_BITS
       Round0DstHashDynamic<EDGES_A, EDGES_B/NB><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb, ROUND0_DST_HASH_DYNAMIC_WORDS * sizeof(u32), stream>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]);
 #else
       Round<1, EDGES_A, EDGES_B/NB, 0, 1><<<tp.trim.blocks/NB, ROUND0_TPB ? ROUND0_TPB : tp.trim.tpb, 0, stream>>>((uint2*)(bufferA+i*qA), (uint2*)(bufferB+i*qB), indexesE[0]+i*qE, indexesE[1+i]); // to .632
@@ -1299,14 +1536,26 @@ struct edgetrimmer {
     TARI_ROUND_TIMING_BEGIN();
     memset_zero(indexesE[0], indexesSize);
 
-    Round<NB, EDGES_B/NB, EDGES_B/2, 1, !SKIP_LATE_NULL_CHECKS><<<tp.trim.blocks, ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
+#if ROUND_TWO_LEVEL
+    memset_zero(rowIdx, NX * sizeof(u32));
+    RoundRows<NB, EDGES_B/NB, EDGES_B/2, 1><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferB, rowBuf, indexesE[1], rowIdx);
+    RoundCols<EDGES_B/2, 1><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferA, rowIdx, indexesE[0]);
+#else
+    Round<NB, EDGES_B/NB, EDGES_B/2, 1, LATE_CHECK_NULL><<<tp.trim.blocks, ROUND1_TPB ? ROUND1_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .296
+#endif
     if (abort) return false;
     TARI_ROUND_TIMING_END(timingRound1);
 
     TARI_ROUND_TIMING_BEGIN();
     memset_zero(indexesE[1], indexesSize);
 
-    Round<1, EDGES_B/2, EDGES_A/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
+#if ROUND_TWO_LEVEL
+    memset_zero(rowIdx, NX * sizeof(u32));
+    RoundRows<1, EDGES_B/2, EDGES_A/4, 0><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferA, rowBuf, indexesE[0], rowIdx);
+    RoundCols<EDGES_A/4, 0><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferB, rowIdx, indexesE[1]);
+#else
+    Round<1, EDGES_B/2, EDGES_A/4, 0, LATE_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]); // to .176
+#endif
     if (abort) return false;
     TARI_ROUND_TIMING_END(timingRound2);
 
@@ -1315,7 +1564,13 @@ struct edgetrimmer {
     memset_zero(indexesE[0], indexesSize);
 #endif // else Round 2 zeroed indexesE[0], its source
 
-    Round<1, EDGES_A/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
+#if ROUND_TWO_LEVEL
+    memset_zero(rowIdx, NX * sizeof(u32));
+    RoundRows<1, EDGES_A/4, EDGES_B/4, 1><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferB, rowBuf, indexesE[1], rowIdx);
+    RoundCols<EDGES_B/4, 1><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferA, rowIdx, indexesE[0]);
+#else
+    Round<1, EDGES_A/4, EDGES_B/4, 1, LATE_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND23_TPB ? ROUND23_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]); // to .117
+#endif
     if (abort) return false;
     TARI_ROUND_TIMING_END(timingRound3);
 
@@ -1333,9 +1588,9 @@ struct edgetrimmer {
       memset_zero(indexesE[1], indexesSize);
 #endif
 #if LATE_ROUND_BPB > 1
-      RoundMulti<EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+      RoundMulti<EDGES_B/4, EDGES_B/4, 0, LATE_CHECK_NULL, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
 #else
-      Round<1, EDGES_B/4, EDGES_B/4, 0, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
+      Round<1, EDGES_B/4, EDGES_B/4, 0, LATE_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferA, (uint2 *)bufferB, indexesE[0], indexesE[1]);
 #endif
       if (abort) return false;
 #if FUSE_FINAL_TAIL_CURRENT
@@ -1352,9 +1607,9 @@ struct edgetrimmer {
       memset_zero(indexesE[0], indexesSize);
 #endif
 #if LATE_ROUND_BPB > 1
-      RoundMulti<EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+      RoundMulti<EDGES_B/4, EDGES_B/4, 1, LATE_CHECK_NULL, LATE_ROUND_BPB, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks / LATE_ROUND_BPB, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, LATE_ROUND_MULTI_SMEM, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
 #else
-      Round<1, EDGES_B/4, EDGES_B/4, 1, !SKIP_LATE_NULL_CHECKS, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
+      Round<1, EDGES_B/4, EDGES_B/4, 1, LATE_CHECK_NULL, LATE_ROUND_SELF_ZERO_IDX><<<tp.trim.blocks, ROUND_LATE_TPB ? ROUND_LATE_TPB : tp.trim.tpb, 0, stream>>>((const uint2 *)bufferB, (uint2 *)bufferA, indexesE[1], indexesE[0]);
 #endif
       if (abort) return false;
     }
