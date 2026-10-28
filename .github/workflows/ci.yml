@@ -96,6 +96,11 @@ jobs:
       - name: Build solver and pool miner for amd
         run: |
           set -euo pipefail
+          # Per-stage timing solver first (docs/amd-validation.md step 5);
+          # the release build then overwrites bin/tari_c29_solver_amd.
+          mkdir -p bin/timing
+          TARI_ARCH_FLAGS="-DTRIM_STAGE_TIMING=1" ./build_solver.sh amd
+          mv bin/tari_c29_solver_amd bin/timing/tari_c29_solver_amd
           ./build_solver.sh amd
           ./build_pool_miner.sh amd
           ./build_solver.sh amd reference
@@ -110,6 +115,7 @@ jobs:
             bin/tari_c29_pool_miner_amd
             bin/tari_c29_solver_amd
             bin/validation/tari_c29_solver_amd_reference
+            bin/timing/tari_c29_solver_amd
           if-no-files-found: error
           retention-days: 14
 
