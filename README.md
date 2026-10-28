@@ -32,10 +32,12 @@ The starter does not change GPU clocks, voltage, fans, or power limits.
 
 ## AMD GPUs (experimental)
 
-AMD support is **experimental and not yet tested on hardware**. It is built
-from the same trimmer sources with HIP, compiles in CI, and passes every host
-test, but nobody has run it on an AMD GPU yet. Use it to help test, not to
-mine unattended.
+AMD support is **experimental and not yet tuned**. It is built from the same
+trimmer sources with HIP, compiles in CI, and passes every host test. Its
+first hardware run (v1.1.8 on a Radeon AI PRO R9700, gfx1201) mined and found
+accepted shares, but at a third of lolMiner's rate on the same card;
+`docs/amd_results_2026-10-28.md` has the numbers and the cause. Use it to
+help test, not to mine unattended.
 
 - Linux and HiveOS only; the Windows package has no AMD backend.
 - Supported GPUs, all in one binary (`bin/tari_c29_pool_miner_amd`):
