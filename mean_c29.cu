@@ -88,6 +88,16 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #if ROUND_MLP < 1 || ROUND_MLP > 16
 #error "ROUND_MLP must be 1 to 16"
 #endif
+// Diagnostic only, wrong results: strips parts of Round's second pass to
+// time them. 1 skips the pass, 2 keeps the atomics and drops the store, 3
+// drops the atomic (slot = lane index), 4 drops the atomic and writes the
+// block's own region in order instead of scattering by bucket.
+#ifndef TARI_DIAG_ROUND
+#define TARI_DIAG_ROUND 0
+#endif
+#if TARI_DIAG_ROUND && (WARP_DST_ATOMICS || ROUND_MLP > 1)
+#error "TARI_DIAG_ROUND needs WARP_DST_ATOMICS=0 and ROUND_MLP=1"
+#endif
 
 #ifndef ROUND_U64_EDGE_LOAD
 #define ROUND_U64_EDGE_LOAD 0
@@ -755,7 +765,7 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
     }
     }
 #else
-    for (int loop = 0; loop < loops; loop++) {
+    for (int loop = 0; loop < (TARI_DIAG_ROUND == 1 ? 0 : loops); loop++) {
       const int lindex = loop * dim + lid;
       if (lindex < edgesInBucket) {
         const int index = maxIn * group + lindex;
@@ -786,8 +796,16 @@ __global__ void Round(const uint2 * __restrict__ src, uint2 * __restrict__ dst,
           StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
           }
 #else
+#if TARI_DIAG_ROUND == 2
+          atomicAdd(dstIdx + bucket, 1);
+#elif TARI_DIAG_ROUND == 3
+          StoreRoundEdge(dst, bucket * maxOut + (lindex % maxOut), outEdge);
+#elif TARI_DIAG_ROUND == 4
+          StoreRoundEdge(dst, group * maxOut + (lindex % maxOut), outEdge);
+#else
           const int bktIdx = min(atomicAdd(dstIdx + bucket, 1), maxOut - 1);
           StoreRoundEdge(dst, bucket * maxOut + bktIdx, outEdge);
+#endif
 #endif
         }
       }
