@@ -171,7 +171,7 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #ifndef ROUND_COLS_TPB
 #define ROUND_COLS_TPB 512
 #endif
-#if ROUND_TWO_LEVEL && (ROUND_ROWS_TPB > 512 || ROUND_COLS_TPB > 512)
+#if ROUND_TWO_LEVEL && (ROUND_ROWS_TPB > 512 || ROUND_COLS_TPB > 512) && ROUND_TWO_LEVEL_DIAG != 3
 #error "ROUND_ROWS_TPB and ROUND_COLS_TPB must be 512 or less: 32-wave staged blocks lose edges on RDNA (see the comment above)"
 #endif
 // Blocks per row in RoundCols.
@@ -183,7 +183,8 @@ const u32 ROW_EDGES_B = EDGES_B * NY;
 #define ROUND_FLUSH 8
 #endif
 // Diagnostic only: 1 makes RoundCols store each edge directly, 2 makes
-// RoundRows store each edge directly, both without staging.
+// RoundRows store each edge directly, both without staging; 3 lifts the
+// block size guard.
 #ifndef ROUND_TWO_LEVEL_DIAG
 #define ROUND_TWO_LEVEL_DIAG 0
 #endif
@@ -895,6 +896,13 @@ constexpr int ROUND_FLUSH2 = 4 * ROUND_FLUSH;              // staging depth per 
 constexpr int EDGES_PER_LL4 = sizeof(ulonglong4) / sizeof(uint2);
 static_assert(ROUND_FLUSH % EDGES_PER_LL4 == 0, "ROUND_FLUSH must be a multiple of 4");
 
+// Clears the row counts on the stream, ahead of RoundRows. A kernel rather
+// than a memset so the ordering with the surrounding kernels is beyond
+// doubt on every runtime.
+__global__ void ZeroRowIdx(u32 * __restrict__ rowIdx) {
+  rowIdx[threadIdx.x] = 0;
+}
+
 // One edge as a padded 32-byte chunk, for the rare staging overflow.
 __device__ __forceinline__ ulonglong4 PaddedChunk(const uint2 edge) {
   return make_ulonglong4(((u64)edge.y << 32) | edge.x, 0, 0, 0);
@@ -1561,7 +1569,7 @@ struct edgetrimmer {
     qE = NX2 / NB;
     for (u32 i = NB; i--; ) {
 #if ROUND_TWO_LEVEL
-      memset_zero(rowIdx, NX * sizeof(u32));
+      ZeroRowIdx<<<1, NX, 0, stream>>>(rowIdx);
       RoundRows<1, EDGES_A, EDGES_B/NB, 0><<<tp.trim.blocks/NB, ROUND_ROWS_TPB, 0, stream>>>((const uint2*)(bufferA+i*qA), rowBuf, indexesE[0]+i*qE, rowIdx);
       RoundCols<EDGES_B/NB, 0><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4*)(bufferB+i*qB), rowIdx, indexesE[1+i]);
 #elif ROUND0_DST_HASH_DYNAMIC_BITS
@@ -1577,7 +1585,7 @@ struct edgetrimmer {
     memset_zero(indexesE[0], indexesSize);
 
 #if ROUND_TWO_LEVEL
-    memset_zero(rowIdx, NX * sizeof(u32));
+    ZeroRowIdx<<<1, NX, 0, stream>>>(rowIdx);
     RoundRows<NB, EDGES_B/NB, EDGES_B/2, 1><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferB, rowBuf, indexesE[1], rowIdx);
     RoundCols<EDGES_B/2, 1><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferA, rowIdx, indexesE[0]);
 #else
@@ -1590,7 +1598,7 @@ struct edgetrimmer {
     memset_zero(indexesE[1], indexesSize);
 
 #if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4
-    memset_zero(rowIdx, NX * sizeof(u32));
+    ZeroRowIdx<<<1, NX, 0, stream>>>(rowIdx);
     RoundRows<1, EDGES_B/2, EDGES_A/4, 0><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferA, rowBuf, indexesE[0], rowIdx);
     RoundCols<EDGES_A/4, 0><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferB, rowIdx, indexesE[1]);
 #else
@@ -1605,7 +1613,7 @@ struct edgetrimmer {
 #endif // else Round 2 zeroed indexesE[0], its source
 
 #if ROUND_TWO_LEVEL && ROUND_TWO_LEVEL_ROUNDS >= 4
-    memset_zero(rowIdx, NX * sizeof(u32));
+    ZeroRowIdx<<<1, NX, 0, stream>>>(rowIdx);
     RoundRows<1, EDGES_A/4, EDGES_B/4, 1><<<tp.trim.blocks, ROUND_ROWS_TPB, 0, stream>>>((const uint2 *)bufferB, rowBuf, indexesE[1], rowIdx);
     RoundCols<EDGES_B/4, 1><<<NX * ROUND_COLS_SPLIT, ROUND_COLS_TPB, 0, stream>>>((const uint2*)rowBuf, (ulonglong4 *)bufferA, rowIdx, indexesE[0]);
 #else
