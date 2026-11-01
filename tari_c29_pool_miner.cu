@@ -165,11 +165,7 @@ static std::string json_escape(const std::string &s) {
 }
 
 static bool split_host_port(const std::string &pool, std::string &host, std::string &port) {
-    size_t p = pool.rfind(':');
-    if (p == std::string::npos || p == 0 || p + 1 >= pool.size()) return false;
-    host = pool.substr(0, p);
-    port = pool.substr(p + 1);
-    return true;
+    return tari_pool::split_host_port(pool, host, port);
 }
 
 static socket_t connect_tcp(const std::string &host, const std::string &port) {
@@ -233,28 +229,12 @@ static std::string hex_bytes(const uint8_t *p, size_t n) {
 
 static bool json_get_string_from(const std::string &line, const char *key, std::string &out, size_t start = 0) {
     size_t p = 0;
-    if (!tari_pool::json_find_value_from(line, key, p, start) ||
-        p == line.size() || line[p] != '"') {
+    if (!tari_pool::json_find_value_from(line, key, p, start)) {
         return false;
     }
-    p++;
-    std::string val;
-    bool esc = false;
-    for (; p < line.size(); ++p) {
-        char c = line[p];
-        if (esc) {
-            val.push_back(c);
-            esc = false;
-        } else if (c == '\\') {
-            esc = true;
-        } else if (c == '"') {
-            out = val;
-            return true;
-        } else {
-            val.push_back(c);
-        }
-    }
-    return false;
+    size_t end_pos = 0;
+    return tari_pool::json_string_at(line, p, out, &end_pos) &&
+           tari_pool::json_value_has_delimiter(line, end_pos);
 }
 
 static bool json_get_uint_from(const std::string &line, const char *key, uint64_t &out, size_t start = 0) {
@@ -307,20 +287,19 @@ static bool parse_job_line(
     bool *invalid_target
 ) {
     *invalid_target = false;
-    size_t start = 0;
-    if (!tari_pool::json_find_value_from(line, "job", start) &&
-        !tari_pool::json_find_value_from(line, "params", start)) {
+    std::string job_obj;
+    if (!tari_pool::json_extract_job_object(line, job_obj)) {
         return false;
     }
 
     Job j = current;
     std::string blob, job_id, target, xn;
-    if (!json_get_string_from(line, "blob", blob, start)) return false;
-    if (!json_get_string_from(line, "job_id", job_id, start)) return false;
-    if (!json_get_string_from(line, "target", target, start)) target = j.target_hex;
-    if (json_get_string_from(line, "xn", xn, start)) j.xn_hex = xn;
+    if (!tari_pool::json_root_string(job_obj, "blob", blob)) return false;
+    if (!tari_pool::json_root_string(job_obj, "job_id", job_id)) return false;
+    if (!tari_pool::json_root_string(job_obj, "target", target)) target = j.target_hex;
+    if (tari_pool::json_root_string(job_obj, "xn", xn)) j.xn_hex = xn;
     uint64_t height = 0;
-    if (json_get_uint_from(line, "height", height, start)) j.height = height;
+    if (tari_pool::json_root_uint(job_obj, "height", height)) j.height = height;
 
     if (!parse_hex_bytes(blob, j.mining_hash, 32)) return false;
     j.blob_hex = blob;
@@ -558,10 +537,8 @@ private:
         }
 
         std::lock_guard<std::mutex> lk(mu_);
-        size_t result_pos = 0;
         std::string id;
-        if (tari_pool::json_find_root_value(line, "result", result_pos) &&
-            json_get_string_from(line, "id", id, result_pos)) {
+        if (tari_pool::json_extract_login_id(line, id) && !id.empty()) {
             login_id_ = id;
         }
 

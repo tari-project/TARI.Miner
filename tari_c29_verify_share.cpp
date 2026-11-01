@@ -39,14 +39,27 @@ static int parse_nonce_be(const char *hex, uint64_t *out) {
     return 0;
 }
 
-static int parse_edges(char *text, uint32_t edges[TARI_C29_PROOFSIZE]) {
+static int parse_edges(const char *text, uint32_t edges[TARI_C29_PROOFSIZE]) {
+    if (!text || *text == '\0') return -1;
     int n = 0;
-    for (char *p = strtok(text, ","); p; p = strtok(nullptr, ",")) {
+    const char *p = text;
+    while (*p != '\0') {
         if (n >= TARI_C29_PROOFSIZE) return -1;
-        char *end = nullptr;
-        unsigned long v = strtoul(p, &end, 10);
-        if (!end || *end != 0) return -1;
+        if (*p < '0' || *p > '9') return -1;
+        if (*p == '0' && p[1] >= '0' && p[1] <= '9') return -1;
+        uint64_t v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (uint64_t)(*p - '0');
+            if (v > UINT32_MAX) return -1;
+            ++p;
+        }
         edges[n++] = (uint32_t)v;
+        if (*p == ',') {
+            ++p;
+            if (*p == '\0') return -1;
+        } else if (*p != '\0') {
+            return -1;
+        }
     }
     return n == TARI_C29_PROOFSIZE ? 0 : -1;
 }

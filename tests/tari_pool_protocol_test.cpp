@@ -328,12 +328,63 @@ static void test_result_status_ok() {
           "a trailing object comma is not success");
 }
 
+static void test_login_and_job_extraction() {
+    std::puts("Login ID and job object extraction:");
+    std::string login_id;
+    check(tari_pool::json_extract_login_id(
+              "{\"id\":1,\"result\":{\"id\":\"session-1\",\"job\":{\"id\":\"nested-job-id\"},\"status\":\"OK\"}}",
+              login_id) &&
+              login_id == "session-1",
+          "direct result.id is extracted without matching nested job.id");
+
+    login_id = "keep";
+    check(!tari_pool::json_extract_login_id(
+              "{\"result\":{\"job\":{\"id\":\"nested-only\"},\"status\":\"OK\"},\"id\":\"root-string-id\"}",
+              login_id),
+          "nested job.id and trailing root id cannot impersonate result.id");
+
+    std::string job_obj;
+    std::string job_id;
+    check(tari_pool::json_extract_job_object(
+              "{\"id\":1,\"result\":{\"id\":\"s\",\"job\":{\"job_id\":\"j1\",\"blob\":\"aa\"}},\"blob\":\"ff\"}",
+              job_obj) &&
+              tari_pool::json_root_string(job_obj, "job_id", job_id) &&
+              job_id == "j1",
+          "login result.job slice isolates job fields from outer object");
+
+    check(tari_pool::json_extract_job_object(
+              "{\"jsonrpc\":\"2.0\",\"method\":\"job\",\"params\":{\"job_id\":\"j2\",\"blob\":\"bb\"}}",
+              job_obj) &&
+              tari_pool::json_root_string(job_obj, "job_id", job_id) &&
+              job_id == "j2",
+          "notification params job object is extracted cleanly");
+}
+
+static void test_split_host_port() {
+    std::puts("Host and port splitting:");
+    std::string host, port;
+    check(tari_pool::split_host_port("pool.tari.com:3111", host, port) &&
+              host == "pool.tari.com" && port == "3111",
+          "hostname and port are split");
+    check(tari_pool::split_host_port("[2001:db8::1]:3111", host, port) &&
+              host == "2001:db8::1" && port == "3111",
+          "bracketed IPv6 literal strips brackets and extracts port");
+    check(!tari_pool::split_host_port("2001:db8::1:3111", host, port),
+          "unbracketed IPv6 address is rejected");
+    check(!tari_pool::split_host_port("pool.tari.com:0", host, port) &&
+              !tari_pool::split_host_port("pool.tari.com:65536", host, port) &&
+              !tari_pool::split_host_port("pool.tari.com:abc", host, port),
+          "invalid or out-of-range ports are rejected");
+}
+
 int main() {
     test_target_conversion();
     test_terminal_sanitizing();
     test_json_root_fields();
     test_strict_uint_parsing();
     test_result_status_ok();
+    test_login_and_job_extraction();
+    test_split_host_port();
     test_line_buffer();
     test_socket_state();
     std::printf("\n%s (%d failure%s)\n",

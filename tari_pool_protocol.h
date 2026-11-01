@@ -517,6 +517,139 @@ inline bool json_value_has_delimiter(
     return delimiter == ',' || delimiter == '}' || delimiter == ']';
 }
 
+inline bool json_root_string(
+    const std::string &json,
+    const char *key,
+    std::string &out
+) {
+    size_t position = 0;
+    if (!json_find_root_value(json, key, position)) return false;
+    size_t end_position = 0;
+    return json_string_at(json, position, out, &end_position) &&
+           json_value_has_delimiter(json, end_position);
+}
+
+inline bool json_extract_login_id(
+    const std::string &json,
+    std::string &login_id
+) {
+    if (!json_root_object_is_valid(json)) return false;
+    size_t result_position = 0;
+    if (!json_find_root_value(json, "result", result_position)) return false;
+    if (result_position >= json.size() || json[result_position] != '{')
+        return false;
+    std::string result_object;
+    size_t result_end = 0;
+    if (!json_container_slice(json, result_position, result_object, &result_end) ||
+        !json_value_has_delimiter(json, result_end)) {
+        return false;
+    }
+    return json_root_string(result_object, "id", login_id);
+}
+
+inline bool json_extract_job_object(
+    const std::string &json,
+    std::string &job_object
+) {
+    if (!json_root_object_is_valid(json)) return false;
+    size_t result_position = 0;
+    if (json_find_root_value(json, "result", result_position) &&
+        result_position < json.size() && json[result_position] == '{') {
+        std::string result_object;
+        size_t result_end = 0;
+        if (json_container_slice(json, result_position, result_object, &result_end) &&
+            json_value_has_delimiter(json, result_end)) {
+            size_t job_position = 0;
+            if (json_find_root_value(result_object, "job", job_position) &&
+                job_position < result_object.size() &&
+                result_object[job_position] == '{') {
+                size_t job_end = 0;
+                if (json_container_slice(result_object, job_position, job_object, &job_end) &&
+                    json_value_has_delimiter(result_object, job_end)) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    size_t job_position = 0;
+    if (json_find_root_value(json, "job", job_position) &&
+        job_position < json.size() && json[job_position] == '{') {
+        size_t job_end = 0;
+        if (json_container_slice(json, job_position, job_object, &job_end) &&
+            json_value_has_delimiter(json, job_end)) {
+            return true;
+        }
+    }
+
+    size_t params_position = 0;
+    if (json_find_root_value(json, "params", params_position) &&
+        params_position < json.size() && json[params_position] == '{') {
+        std::string params_object;
+        size_t params_end = 0;
+        if (json_container_slice(json, params_position, params_object, &params_end) &&
+            json_value_has_delimiter(json, params_end)) {
+            size_t nested_job_pos = 0;
+            if (json_find_root_value(params_object, "job", nested_job_pos) &&
+                nested_job_pos < params_object.size() &&
+                params_object[nested_job_pos] == '{') {
+                size_t nested_job_end = 0;
+                if (json_container_slice(params_object, nested_job_pos, job_object, &nested_job_end) &&
+                    json_value_has_delimiter(params_object, nested_job_end)) {
+                    return true;
+                }
+            }
+            job_object = std::move(params_object);
+            return true;
+        }
+    }
+    return false;
+}
+
+inline bool split_host_port(
+    const std::string &pool,
+    std::string &host,
+    std::string &port
+) {
+    if (pool.empty()) return false;
+    std::string parsed_host;
+    std::string parsed_port;
+    if (pool.front() == '[') {
+        size_t close_bracket = pool.find(']');
+        if (close_bracket == std::string::npos || close_bracket <= 1 ||
+            close_bracket + 2 > pool.size() || pool[close_bracket + 1] != ':') {
+            return false;
+        }
+        parsed_host = pool.substr(1, close_bracket - 1);
+        if (parsed_host.find('[') != std::string::npos ||
+            parsed_host.find(']') != std::string::npos) {
+            return false;
+        }
+        parsed_port = pool.substr(close_bracket + 2);
+    } else {
+        size_t colon = pool.find(':');
+        if (colon == std::string::npos || colon == 0 ||
+            colon + 1 >= pool.size() ||
+            pool.find(':', colon + 1) != std::string::npos) {
+            return false;
+        }
+        parsed_host = pool.substr(0, colon);
+        parsed_port = pool.substr(colon + 1);
+    }
+
+    uint64_t port_number = 0;
+    if (!parse_uint_at(parsed_port, 0, port_number) ||
+        port_number == 0 || port_number > 65535) {
+        return false;
+    }
+    for (char c : parsed_port) {
+        if (c < '0' || c > '9') return false;
+    }
+    host = std::move(parsed_host);
+    port = std::move(parsed_port);
+    return true;
+}
+
 // True for a response whose root "result" is an object carrying "status":"OK".
 // Pools in this dialect answer a submit either with `"result":true` or with the
 // same status object they use for login, so both forms must be recognised.
