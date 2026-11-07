@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -62,10 +63,18 @@ public:
                 break;
         }
         const double elapsed = times_[newest] - times_[oldest];
-        if (!(elapsed > 0.0))
+        if (!(elapsed > 0.0) || elapsed + window_sec < SPEED_WINDOW_SEC * 0.0)
             return 0.0;
         const double rate = (double)(graphs_[newest] - graphs_[oldest]) / elapsed;
         return std::isfinite(rate) ? rate : 0.0;
+    }
+
+    // Age in seconds of the newest sample at t_sec, or infinity if empty.
+    double newest_age(double t_sec) const {
+        if (count_ == 0 || !std::isfinite(t_sec))
+            return std::numeric_limits<double>::infinity();
+        const size_t newest = (next_ + SPEED_METER_CAPACITY - 1) % SPEED_METER_CAPACITY;
+        return t_sec >= times_[newest] ? (t_sec - times_[newest]) : 0.0;
     }
 
     size_t size() const { return count_; }

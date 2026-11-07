@@ -42,11 +42,15 @@ json_number_array() {
 # read_log_stats LOG_FILE
 #   Sets rate, gpu_accepted and gpu_rejected from one worker log.
 read_log_stats() {
-    local log_file="$1" log_window log_size log_start log_skip
+    local log_file="$1" log_window log_size log_start log_skip fresh
     rate=0
     gpu_accepted=0
     gpu_rejected=0
-    if [[ -f "$log_file" && $((now - $(stat -c %Y "$log_file" 2>/dev/null || echo 0))) -le 180 ]]; then
+    if [[ -f "$log_file" ]]; then
+        fresh=0
+        if ((now - $(stat -c %Y "$log_file" 2>/dev/null || echo 0) <= 180)); then
+            fresh=1
+        fi
         # Only a whole line in the miner's own report format counts, and the
         # fields are read by position. The miner logs pool text after a prefix
         # such as "pool error:" and caps it well below the stdio buffer size, so
@@ -66,7 +70,7 @@ read_log_stats() {
             log_start=$((log_size - log_window + 1))
             log_skip=1
         fi
-        read -r rate gpu_accepted gpu_rejected < <(tail -c "+$log_start" "$log_file" | LC_ALL=C awk -v now="$now" -v skip="$log_skip" '
+        read -r rate gpu_accepted gpu_rejected < <(tail -c "+$log_start" "$log_file" | LC_ALL=C awk -v now="$now" -v skip="$log_skip" -v file_fresh="$fresh" '
             NR == 1 && skip == 1 { next }
             /^speed [0-9]+\.[0-9]+ g\/s \| avg [0-9]+\.[0-9]+ g\/s \| graphs=[0-9]+ cycles=[0-9]+ submitted=[0-9]+ accepted=[0-9]+ rejected=[0-9]+ t=[0-9]+( stale=[0-9]+)?$/ {
                 a = substr($12, 10)
@@ -77,7 +81,7 @@ read_log_stats() {
                 rejected = r
                 # Only a fresh line sets the rate, so a stale line, or a line
                 # cut off mid-write (t=17...), cannot hide the latest report.
-                if (now - t <= 90 && t - now <= 30) {
+                if (file_fresh && now - t <= 90 && t - now <= 30) {
                     rate = $2
                     fresh = 1
                 }
@@ -159,13 +163,31 @@ pci_bus_number() {
 }
 
 gpu_stats_rows=()
-if [[ -f "$GPU_STATS_JSON" ]] && command -v jq >/dev/null 2>&1; then
-    while read -r line; do
-        gpu_stats_rows+=("$line")
-    done < <(jq -r 'if (.busids | type) == "array" then
-            range(0; .busids | length) as $i
-            | "\(.busids[$i]) \(.temp[$i] // 0) \(.fan[$i] // 0)"
-        else empty end' "$GPU_STATS_JSON" 2>/dev/null || true)
+if [[ -f "$GPU_STATS_JSON" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+        while read -r line; do
+            gpu_stats_rows+=("$line")
+        done < <(jq -r 'if (.busids | type) == "array" then
+                range(0; .busids | length) as $i
+                | "\(.busids[$i]) \(.temp[$i] // 0) \(.fan[$i] // 0)"
+            else empty end' "$GPU_STATS_JSON" 2>/dev/null || true)
+    elif command -v python3 >/dev/null 2>&1; then
+        while read -r line; do
+            gpu_stats_rows+=("$line")
+        done < <(python3 -c 'import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    busids = d.get("busids")
+    temps = d.get("temp") or []
+    fans = d.get("fan") or []
+    if isinstance(busids, list):
+        for i, b in enumerate(busids):
+            t = temps[i] if i < len(temps) and temps[i] is not None else 0
+            f = fans[i] if i < len(fans) and fans[i] is not None else 0
+            print(f"{b} {t} {f}")
+except Exception:
+    pass' "$GPU_STATS_JSON" 2>/dev/null || true)
+    fi
 fi
 amd_indexes="$(ls "$TARI_LOG_DIR" 2>/dev/null | sed -n -E 's/^amd(0|[1-9][0-9]*)\.log$/\1/p' | sort -n)"
 while read -r index; do

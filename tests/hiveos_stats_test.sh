@@ -150,11 +150,25 @@ fi
 check "log of exactly 1 MiB" '"hs":[13.650]' '"ar":[2,1]' < "$TEMP_ROOT/exact.log"
 
 # A report older than 90 s means the miner stopped reporting; the counters
-# are still the last known ones.
+# are still the last known ones (even if the log file mtime is older than 180 s).
 check "stale report" '"hs":[0.000]' '"ar":[2,1]' <<EOF
 speed 13.65 g/s | avg 12.10 g/s | graphs=7260 cycles=12 submitted=3 accepted=2 rejected=1 t=$((now - 200))
 pool error: {"id":999,"error":"still connected"}
 EOF
+touch -d "@$((now - 300))" "$TEMP_ROOT/logs/gpu0.log"
+old_mtime_stats="$(
+    PATH="$TEMP_ROOT/bin:$PATH" \
+    CUSTOM_CONFIG_FILENAME="$TEMP_ROOT/miner.env" \
+    TARI_LOG_DIR="$TEMP_ROOT/logs" \
+    TARI_DEVICES=all \
+        bash "$ROOT/hiveos/h-stats.sh"
+)"
+for expected in '"hs":[0.000]' '"ar":[2,1]'; do
+    if [[ "$old_mtime_stats" != *"$expected"* ]]; then
+        echo "FAIL old log mtime: expected $expected in $old_mtime_stats" >&2
+        fail=1
+    fi
+done
 
 # Only pool text: nothing is reported.
 check "forged only" '"hs":[0.000]' '"ar":[0,0]' <<EOF
