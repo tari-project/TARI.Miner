@@ -84,15 +84,25 @@ if [[ -x "$TARI_AMD_MINER" ]]; then
     fi
 fi
 
-# A rig with only AMD GPUs may have no nvidia-smi, or one that cannot reach a
-# driver. Skip NVIDIA there; with no AMD GPU either, that is still an error.
-if ! gpu_output="$("$TARI_NVIDIA_SMI" --query-gpu=index,compute_cap,name --format=csv,noheader,nounits 2>&1)"; then
+# nvidia-smi can exit non-zero when it lost a GPU and still list the remaining
+# reachable GPUs. Keep its output and drop non-GPU error lines below.
+gpu_output="$("$TARI_NVIDIA_SMI" --query-gpu=index,compute_cap,name --format=csv,noheader,nounits 2>&1 || true)"
+has_nvidia_rows=0
+while IFS=',' read -r raw_index raw_cap raw_name; do
+    if [[ "${raw_index:-}" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+        has_nvidia_rows=1
+        break
+    fi
+done <<< "$gpu_output"
+if ((has_nvidia_rows == 0)); then
     if ((amd_detected == 0)); then
         echo "ERROR: nvidia-smi could not enumerate NVIDIA GPUs." >&2
-        echo "$gpu_output" >&2
+        [[ -z "$gpu_output" ]] || echo "$gpu_output" >&2
         exit 3
     fi
-    echo "NOTICE: nvidia-smi could not enumerate NVIDIA GPUs; starting AMD GPUs only."
+    if [[ -n "${gpu_output//[[:space:]]/}" ]]; then
+        echo "NOTICE: nvidia-smi could not enumerate NVIDIA GPUs; starting AMD GPUs only."
+    fi
     gpu_output=""
 fi
 
@@ -130,7 +140,7 @@ start_worker() {
 }
 
 while IFS=',' read -r raw_index raw_cap raw_name; do
-    [[ -z "${raw_index//[[:space:]]/}" ]] && continue
+    [[ "${raw_index:-}" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]] || continue
     detected=$((detected + 1))
     index="$(trim "$raw_index")"
     cap="$(trim "$raw_cap")"

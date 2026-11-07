@@ -179,7 +179,9 @@ public:
   }
 
   static int nonce_cmp(const void *a, const void *b) {
-    return *(word_t *)a - *(word_t *)b;
+    word_t wa = *(const word_t *)a;
+    word_t wb = *(const word_t *)b;
+    return (wa > wb) - (wa < wb);
   }
 
 #if GRAPH_UNION_SKIP

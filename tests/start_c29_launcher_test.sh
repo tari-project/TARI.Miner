@@ -267,4 +267,20 @@ run_launcher "$no_amd_root" TARI_DRY_RUN=1
 expect_status "$no_amd_root" 0 "AMD backend that cannot run"
 expect_output "$no_amd_root" "Started 2 miner worker(s) from 2 detected NVIDIA GPU(s)." "AMD backend that cannot run"
 
+# nvidia-smi exits non-zero when it lost a GPU but still lists the others:
+# start-c29.sh must still launch the healthy GPU and ignore the error line.
+partial_root="$(make_case partial-nvidia)"
+cat > "$partial_root/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+printf '0, 8.9, Test GPU 0\n'
+echo "Unable to determine the device handle for GPU0000:02:00.0: Unknown Error. It's lost."
+exit 15
+EOF
+chmod +x "$partial_root/nvidia-smi"
+write_nvidia_miner "$partial_root/bin/tari_c29_pool_miner_sm_89"
+run_launcher "$partial_root" TARI_DRY_RUN=1
+expect_status "$partial_root" 0 "partial nvidia-smi failure"
+expect_output "$partial_root" "--worker rig-gpu0" "partial nvidia-smi failure"
+expect_output "$partial_root" "Started 1 miner worker(s) from 1 detected NVIDIA GPU(s)." "partial nvidia-smi failure"
+
 echo "shell launcher regressions passed"
